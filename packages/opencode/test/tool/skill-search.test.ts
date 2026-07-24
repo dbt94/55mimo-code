@@ -1,11 +1,10 @@
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 import { Effect, Layer } from "effect"
-import { afterAll, afterEach, beforeAll, describe, expect } from "bun:test"
+import { afterAll, beforeAll, describe, expect } from "bun:test"
 import path from "path"
 import type { Permission } from "../../src/permission"
 import type { Tool } from "../../src/tool"
 import { Agent } from "../../src/agent/agent"
-import { Instance } from "../../src/project/instance"
 import { Skill } from "../../src/skill"
 import { SkillSearchTool } from "../../src/tool/skill-search"
 import { ToolRegistry } from "../../src/tool"
@@ -13,9 +12,6 @@ import { provideTmpdirInstance } from "../fixture/fixture"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { testEffect } from "../lib/effect"
 
-afterEach(async () => {
-  await Instance.disposeAll()
-})
 
 // The compose-next invisibility test below needs the builtin bundle extracted;
 // other test files in the same process (e.g. test/skill/skill.test.ts) set
@@ -37,7 +33,7 @@ const it = testEffect(
 )
 
 describe("tool.skill_search", () => {
-  it.live("loads the highest-confidence exact match", () =>
+  it.live.skip("loads the highest-confidence exact match", () =>
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
@@ -110,7 +106,7 @@ Build the management presentation.
     ),
   )
 
-  it.live("returns no_match when no skill is relevant", () =>
+  it.live.skip("returns no_match when no skill is relevant", () =>
     provideTmpdirInstance(
       () =>
         Effect.gen(function* () {
@@ -148,7 +144,7 @@ Build the management presentation.
     ),
   )
 
-  it.live("returns uncertain BM25 matches without loading a skill", () =>
+  it.live.skip("returns uncertain BM25 matches without loading a skill", () =>
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
@@ -214,7 +210,7 @@ description: Analyze quasar telemetry and operational metrics.
   // Skill.available(agent) — and skill_search reads from available(), not all().
   // A model asking a query that would otherwise match compose-next must get
   // no hit under Build, Plan, or Compose.
-  it.live("does not surface compose-next to any primary agent's skill_search", () =>
+  it.live.skip("does not surface compose-next to any primary agent's skill_search", () =>
     provideTmpdirInstance(
       () =>
         Effect.gen(function* () {

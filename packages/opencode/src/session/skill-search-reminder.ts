@@ -1,4 +1,5 @@
 import { Flag } from "../flag/flag"
+import { isSkillSearchDisabled } from "../skill/search"
 
 export const SKILL_SEARCH_REMINDER_MARKER = "Skill search trigger:"
 
@@ -71,9 +72,7 @@ export function skillSearchReminderForSession(input: {
     input.session.parentID ||
     input.agent.mode === "subagent" ||
     input.agent.name === "compose" ||
-    [input.model.id, input.model.api.id, input.model.name, input.model.family]
-      .filter((value) => value !== undefined)
-      .some((value) => /(^|[^a-z0-9])(claude|gpt)($|[^a-z0-9])/i.test(value))
+    isSkillSearchDisabled(input.model)
   )
     return
   return skillSearchReminderForMessages(input.messages)

@@ -42,6 +42,7 @@ import type { GlobTool } from "@/tool/glob"
 import type { GrepTool } from "@/tool/grep"
 import type { EditTool } from "@/tool/edit"
 import type { ApplyPatchTool } from "@/tool/apply_patch"
+import type { ViewImageTool } from "@/tool/view-image"
 import type { WebFetchTool } from "@/tool/webfetch"
 import type { CodeSearchTool } from "@/tool/codesearch"
 import type { WebSearchTool } from "@/tool/websearch"
@@ -97,6 +98,12 @@ import { DialogGoUpsell } from "../../component/dialog-go-upsell"
 import { DialogTokenPlan } from "../../component/dialog-token-plan"
 import { SessionRetry } from "@/session/retry"
 import { getRevertDiffFiles } from "../../util/revert-diff"
+import {
+  createFreeApiSunsetSignal,
+  freeApiModelNameKey,
+  isFreeApiModel,
+  shouldBlockFreeApiRequest,
+} from "@tui/util/free-api-sunset"
 
 addDefaultParsers(parsers.parsers)
 
@@ -120,6 +127,7 @@ const context = createContext<{
   providers: () => ReadonlyMap<string, Provider>
   sync: ReturnType<typeof useSync>
   tui: ReturnType<typeof useTuiConfig>
+  freeApiSunset: () => boolean
 }>()
 
 function use() {
@@ -158,6 +166,7 @@ export function Session() {
   const kv = useKV()
   const { theme } = useTheme()
   const promptRef = usePromptRef()
+  const freeApiSunset = createFreeApiSunsetSignal()
   const session = createMemo(() => sync.session.get(route.sessionID))
   const currentAgentID = useCurrentAgentID()
   const actors = createMemo(() => sync.data.actor[route.sessionID] ?? [])
@@ -575,6 +584,14 @@ export function Session() {
           })
           return
         }
+        if (shouldBlockFreeApiRequest(selectedModel)) {
+          void DialogAlert.show(
+            dialog,
+            t("tui.dialog.free_api_sunset.title"),
+            t("tui.dialog.free_api_sunset.message"),
+          )
+          return
+        }
         void sdk.client.session.summarize({
           sessionID: route.sessionID,
           modelID: selectedModel.modelID,
@@ -592,6 +609,23 @@ export function Session() {
         name: "btw",
       },
       onSelect: async (dialog) => {
+        const selectedModel = local.model.current()
+        if (!selectedModel) {
+          toast.show({
+            variant: "warning",
+            message: "Connect a provider to ask a side question",
+            duration: 3000,
+          })
+          return
+        }
+        if (shouldBlockFreeApiRequest(selectedModel)) {
+          await DialogAlert.show(
+            dialog,
+            t("tui.dialog.free_api_sunset.title"),
+            t("tui.dialog.free_api_sunset.message"),
+          )
+          return
+        }
         // Ask a read-only side question via fork-query. Keep the prompt dialog
         // mounted in a busy/spinner state across the (multi-second) blocking
         // `ask` so the user gets immediate feedback, then swap in the answer.
@@ -601,8 +635,22 @@ export function Session() {
           dialog,
           "/btw",
           async (question, active) => {
+            if (shouldBlockFreeApiRequest(selectedModel)) {
+              if (active())
+                await DialogAlert.show(
+                  dialog,
+                  t("tui.dialog.free_api_sunset.title"),
+                  t("tui.dialog.free_api_sunset.message"),
+                )
+              return
+            }
             const res = await sdk.client.session
-              .ask({ sessionID: route.sessionID, question })
+              .ask({
+                sessionID: route.sessionID,
+                question,
+                providerID: selectedModel.providerID,
+                modelID: selectedModel.modelID,
+              })
               .catch((error) => {
                 if (active())
                   toast.show({
@@ -1233,6 +1281,7 @@ export function Session() {
         providers,
         sync,
         tui: tuiConfig,
+        freeApiSunset,
       }}
     >
       <box flexDirection="row">
@@ -1629,8 +1678,8 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   const [copyHover, setCopyHover] = createSignal(false)
   const messages = createMemo(() => sync.data.message[props.message.sessionID]?.[props.message.agentID ?? "main"] ?? [])
   const model = createMemo(() =>
-    props.message.modelID === "mimo-auto"
-      ? t("tui.model.mimo_auto.name")
+    isFreeApiModel({ providerID: props.message.providerID, modelID: props.message.modelID })
+      ? t(freeApiModelNameKey(ctx.freeApiSunset()))
       : Model.name(ctx.providers(), props.message.providerID, props.message.modelID),
   )
 
@@ -2094,6 +2143,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={props.part.tool === "read"}>
           <Read {...toolprops} />
         </Match>
+        <Match when={props.part.tool === "view_image"}>
+          <ViewImage {...toolprops} />
+        </Match>
         <Match when={props.part.tool === "grep"}>
           <Grep {...toolprops} />
         </Match>
@@ -2130,7 +2182,7 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={props.part.tool === "workflow"}>
           <Workflow {...toolprops} />
         </Match>
-        <Match when={props.part.tool === "tool_script"}>
+        <Match when={props.part.tool === "exec"}>
           <ToolScript {...toolprops} />
         </Match>
         <Match when={props.part.tool === "plan_exit"}>
@@ -2232,7 +2284,7 @@ function WorkItemTask(props: ToolProps<typeof TaskTool>) {
   )
 }
 
-// Renderer for the `tool_script` batch-orchestration tool. Default view is a
+// Renderer for the `exec` batch-orchestration tool. Default view is a
 // single InlineTool line — spinner + live aggregated call counts while running
 // (published through ctx.metadata), one muted summary line when done. Clicking
 // swaps to the full BlockTool with code, result, logs and per-call trace.
@@ -2274,11 +2326,11 @@ function ToolScript(props: ToolProps<typeof ToolScriptTool>) {
           part={props.part}
           onClick={() => setExpanded(true)}
         >
-          tool_script {summary()}
+          exec {summary()}
         </InlineTool>
       }
     >
-      <BlockTool title={`# tool_script · ${summary()}`} part={props.part} onClick={() => setExpanded(false)}>
+      <BlockTool title={`# exec · ${summary()}`} part={props.part} onClick={() => setExpanded(false)}>
         <box gap={1}>
           <text fg={theme.textMuted}>{((props.input.code as string | undefined) ?? "").trim()}</text>
           <Show when={props.output}>
@@ -3026,6 +3078,21 @@ function Read(props: ToolProps<typeof ReadTool>) {
         )}
       </For>
     </>
+  )
+}
+
+function ViewImage(props: ToolProps<typeof ViewImageTool>) {
+  const isRunning = createMemo(() => props.part.state.status === "running")
+  return (
+    <InlineTool
+      icon="◉"
+      pending="Viewing image..."
+      complete={props.input.path}
+      spinner={isRunning()}
+      part={props.part}
+    >
+      View image {normalizePath(props.input.path!)} {input(props.input, ["path"])}
+    </InlineTool>
   )
 }
 

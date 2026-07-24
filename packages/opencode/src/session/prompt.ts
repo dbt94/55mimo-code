@@ -306,7 +306,7 @@ export const layer = Layer.effect(
     const actorRegistry = yield* ActorRegistry.Service
     const inbox = yield* Inbox.Service
 
-    // Late-bound ref (see tool-script-ref.ts): tool_script dispatches MCP tools
+    // Late-bound ref (see tool-script-ref.ts): exec dispatches MCP tools
     // through the same live client set the agent sees. Populated here (not in
     // ToolRegistry) because MCP's layer lives in this graph — the registry
     // providing MCP.defaultLayer itself would duplicate client connections.
@@ -337,7 +337,7 @@ export const layer = Layer.effect(
         const captureSession = yield* sessions.get(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!captureSession) return empty
         const [skills, env, instructions] = yield* Effect.all([
-          sys.skills(ag),
+          sys.skills(ag, model),
           sys.environment(model, captureSession.time.created),
           instruction.system().pipe(Effect.orDie),
         ])
@@ -807,7 +807,26 @@ Keep planning proportional to task complexity: for simple combinations, two or t
         return input.messages
       }
 
-      if (input.agent.name !== "plan" || assistantMessage?.info.agent === "plan") return input.messages
+      if (input.agent.name !== "plan") return input.messages
+
+      if (assistantMessage?.info.agent === "plan") {
+        // Only on a fresh user turn: at step 1 the user message is the last
+        // message; at step 2+ this turn's own assistant message follows it.
+        // insertReminders runs every step and updatePart persists, so
+        // injecting past step 1 would stack duplicate reminders.
+        if (input.messages.at(-1) !== userMessage) return input.messages
+        const plan = Session.plan(input.session)
+        const part = yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: userMessage.info.id,
+          sessionID: userMessage.info.sessionID,
+          type: "text",
+          text: `<system-reminder>Plan mode is still active (read-only; only writable file: ${plan}). Do NOT implement. End your turn with the question tool or plan_exit.</system-reminder>`,
+          synthetic: true,
+        })
+        userMessage.parts.push(part)
+        return input.messages
+      }
 
       const plan = Session.plan(input.session)
       const exists = yield* fsys.existsSafe(plan)
@@ -976,7 +995,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         abort: options.abortSignal!,
         messageID: input.processor.message.id,
         callID: options.toolCallId,
-        extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
+        extra: {
+          model: input.model,
+          bypassAgentCheck: input.bypassAgentCheck,
+          promptOps,
+          ...(whitelist ? { toolWhitelist: [...whitelist] } : {}),
+        },
         agent: input.agent.name,
         actorID: input.agentID,
         taskId: input.task_id,
@@ -1016,7 +1040,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       })
 
       for (const item of yield* registry.tools({
-        modelID: ModelID.make(input.model.api.id),
+        modelID: input.model.id,
         providerID: input.model.providerID,
         agent: input.agent,
       })) {
@@ -3543,7 +3567,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
 
             const [skills, env, instructions] = yield* Effect.all([
-              sys.skills(agent),
+              sys.skills(agent, model),
               sys.environment(model, session.time.created),
               instruction.system().pipe(Effect.orDie),
             ])

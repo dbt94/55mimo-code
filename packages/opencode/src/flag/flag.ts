@@ -164,13 +164,6 @@ export const Flag = {
   MIMOCODE_SERVER_USERNAME: process.env["MIMOCODE_SERVER_USERNAME"],
   MIMOCODE_ENABLE_QUESTION_TOOL: truthy("MIMOCODE_ENABLE_QUESTION_TOOL"),
 
-  // Defaults to false (tool_script hidden). Set MIMOCODE_ENABLE_TOOL_SCRIPT=true
-  // (or 1, or the umbrella MIMOCODE_EXPERIMENTAL) to register the tool_script
-  // sandbox tool. Getter so tests can flip the env var at runtime.
-  get MIMOCODE_ENABLE_TOOL_SCRIPT() {
-    return MIMOCODE_EXPERIMENTAL || truthy("MIMOCODE_ENABLE_TOOL_SCRIPT")
-  },
-
   // Defaults to false. Set MIMOCODE_ENABLE_TRY_BEST_HANDOFF=true (or 1) to
   // enable try-best loop detection, automatic turn pausing, and handoff UI.
   MIMOCODE_ENABLE_TRY_BEST_HANDOFF: truthy("MIMOCODE_ENABLE_TRY_BEST_HANDOFF"),
@@ -226,10 +219,11 @@ export const Flag = {
   // global singleton workspace and child permission-approval routing. Enable with
   // MIMOCODE_EXPERIMENTAL_ORCHESTRATOR=true (or the umbrella MIMOCODE_EXPERIMENTAL).
   MIMOCODE_EXPERIMENTAL_ORCHESTRATOR: MIMOCODE_EXPERIMENTAL || truthy("MIMOCODE_EXPERIMENTAL_ORCHESTRATOR"),
-  // Defaults to true: dynamic workflow + built-in deep-research are on by default.
-  // Set MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL=false to opt out. The env-var name is
-  // kept for backwards compat (long-running experiments still pass it as `1`).
-  MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL: !falsy("MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL"),
+  // Defaults to OFF (opt-in): dynamic workflows and built-in workflows.
+  // Enable with MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL=true (or the umbrella
+  // MIMOCODE_EXPERIMENTAL flag).
+  MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL:
+    MIMOCODE_EXPERIMENTAL || truthy("MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL"),
   // Defaults to true: cron + self-paced loop scheduling are on by default.
   // Set MIMOCODE_EXPERIMENTAL_CRON=false to opt out. Runtime kill switch is
   // MIMOCODE_DISABLE_CRON (checked live every tick).
