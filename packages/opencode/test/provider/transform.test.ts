@@ -3126,13 +3126,30 @@ describe("ProviderTransform.variants", () => {
     expect(result).toEqual({})
   })
 
-  test("deepseek returns empty object", () => {
+  test("official deepseek V4 returns high and max variants", () => {
     const model = createMockModel({
-      id: "deepseek/deepseek-chat",
+      id: "deepseek/deepseek-v4-pro",
       providerID: "deepseek",
       api: {
-        id: "deepseek-chat",
+        id: "deepseek-v4-pro",
         url: "https://api.deepseek.com",
+        npm: "@ai-sdk/openai-compatible",
+      },
+    })
+    const result = ProviderTransform.variants(model)
+    expect(result).toEqual({
+      high: { reasoningEffort: "high" },
+      max: { reasoningEffort: "max" },
+    })
+  })
+
+  test("deepseek variants remain disabled for non-official openai-compatible providers", () => {
+    const model = createMockModel({
+      id: "custom/deepseek-v4-pro",
+      providerID: "custom",
+      api: {
+        id: "deepseek-v4-pro",
+        url: "https://api.example.com",
         npm: "@ai-sdk/openai-compatible",
       },
     })
@@ -3183,6 +3200,20 @@ describe("ProviderTransform.variants", () => {
   })
 
   describe("@openrouter/ai-sdk-provider", () => {
+    test("deepseek variants remain disabled", () => {
+      const model = createMockModel({
+        id: "openrouter/deepseek/deepseek-v4-pro",
+        providerID: "openrouter",
+        api: {
+          id: "deepseek/deepseek-v4-pro",
+          url: "https://openrouter.ai",
+          npm: "@openrouter/ai-sdk-provider",
+        },
+      })
+      const result = ProviderTransform.variants(model)
+      expect(result).toEqual({})
+    })
+
     test("returns empty object for non-qualifying models", () => {
       const model = createMockModel({
         id: "openrouter/test-model",
