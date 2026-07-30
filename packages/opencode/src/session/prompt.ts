@@ -55,12 +55,6 @@ import {
   TEXT_NGRAM_RECOVERY_REMIND,
   TEXT_NGRAM_RECOVERY_REPLAN,
 } from "../session/prompt/text-ngram-detection"
-import {
-  EMPTY_STEP_MAX_RECOVERY,
-  EMPTY_STEP_RECOVERY_REMIND,
-  EMPTY_STEP_RECOVERY_REPLAN,
-  isEmptyStep,
-} from "../session/prompt/empty-step-detection"
 import { builtinSkillRoot, matchDocumentSkills } from "@/skill/builtin/extract"
 import { ToolRegistry } from "../tool"
 import { MCP } from "../mcp"
@@ -277,6 +271,7 @@ export interface Interface {
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   readonly sweepOrphanAssistants: (sessionID: SessionID, immediate?: boolean) => Effect.Effect<void>
+  readonly sweepOrphanToolParts: (sessionID: SessionID) => Effect.Effect<void>
   readonly predict: (input: { sessionID: SessionID }) => Effect.Effect<string>
 }
 
@@ -427,6 +422,142 @@ export const layer = Layer.effect(
 
       if (inserted) yield* prune.resetThresholds(input.sessionID)
       return inserted
+    })
+
+    // Upper bound on how long a rebuild may block waiting for a checkpoint
+    // writer it started itself. `waitForWriter` takes NO timeout argument — its
+    // own 5-min bound is hardcoded at checkpoint.ts:986 — so the bound is
+    // applied by wrapping the call below.
+    //
+    // MANUAL: 5 min, matching waitForWriter's internal bound (i.e. unchanged
+    // behaviour). A human just typed /rebuild and is watching a spinner.
+    //
+    // AUTO: 3 min. The auto path fires mid-turn WITHOUT being asked, so the
+    // stall is unsolicited and must not be as generous as the manual one.
+    // 180s is exactly the top of the 60-180s band the writer documents for
+    // itself (checkpoint.ts:981), so it admits every writer that behaves as
+    // designed while refusing to hold an unrequested turn for the extra two
+    // minutes a watching human would tolerate. Abandoning the wait does not
+    // cancel the writer — it keeps running detached — so a bound that is too
+    // tight costs one degraded turn, not the checkpoint itself.
+    const MANUAL_WRITER_WAIT_MS = 300_000
+    const AUTO_WRITER_WAIT_MS = 180_000
+
+    /**
+     * Outcome of a rebuild attempt that is allowed to WRITE a checkpoint first.
+     *
+     * Named for what the attempt DID, not for the state it started in: reading a
+     * call site, `writer-failed` has to say that a writer was started and awaited
+     * and only then gave up. An earlier name (`no-checkpoint`) described the entry
+     * condition instead, which made `if (attempt === "no-checkpoint") compact()`
+     * read as "no checkpoint, so compact immediately" — the writer attempt is
+     * invisible at the call site, and that is exactly how it was misread.
+     *
+     * - "rebuilt"       a boundary was inserted; context is freed.
+     * - "writer-failed" there was no checkpoint, so a writer WAS STARTED AND
+     *                   AWAITED here (bounded by `writerWaitMs`), and it then
+     *                   failed / never ran / the bound expired. This is the ONLY
+     *                   state in which a caller may fall back to compaction.
+     * - "insert-failed" a checkpoint DOES exist but the boundary insert still
+     *                   refused (degraded, e.g. renderRebuildContext empty).
+     *                   Callers must report this honestly and must NOT compact.
+     */
+    type RebuildAttempt = "rebuilt" | "writer-failed" | "insert-failed"
+
+    // The single place that decides whether a rebuild may degrade to
+    // compaction. Every caller — both auto context-overflow sites and the
+    // manual /rebuild command — goes through here, so the fallback condition
+    // is ONE condition rather than several lookalikes that can drift apart.
+    //
+    // Ordering matters: we try the on-disk checkpoint FIRST and only start a
+    // writer when there is no checkpoint at all. When a checkpoint already
+    // exists this deliberately does not block on an in-flight writer that is
+    // producing a fresher one — that separate, unchanged policy is documented
+    // on rebuildFromCheckpoint above and is NOT the justification for waiting
+    // here. Waiting here is justified only by the no-checkpoint case, where the
+    // alternative is `compaction.create`, which inserts a bare boundary marker
+    // and therefore drops all pre-boundary history with no summary at all.
+    const rebuildEnsuringCheckpoint = Effect.fn("SessionPrompt.rebuildEnsuringCheckpoint")(function* (input: {
+      sessionID: SessionID
+      msgs: MessageV2.WithParts[]
+      agentID?: string
+      agent: string
+      model: { providerID: string; id: string }
+      /** Upper bound on the writer wait; see {AUTO,MANUAL}_WRITER_WAIT_MS. */
+      writerWaitMs: number
+      /** Run once, immediately before the wait begins, to explain the stall. */
+      onWaitingForWriter?: Effect.Effect<void>
+    }) {
+      // 1. Whatever is already on disk.
+      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false))))
+        return "rebuilt" as const
+
+      // 2. Distinguish "nothing to rebuild from" (may compact) from "checkpoint
+      //    present but the insert failed" (must not compact).
+      //
+      //    `hasCheckpoint` alone is NOT that distinction: it is a bare
+      //    `Bun.file(...).exists()` (checkpoint.ts:1021), and
+      //    `tryStartCheckpointWriter` scaffolds an EMPTY TEMPLATE at
+      //    checkpoint.ts:650 *before* spawning the writer. Since
+      //    `prune.fireCheckpoints` (prune.ts:289) runs immediately before the
+      //    overflow check, "template on disk, watermark not yet written" is a
+      //    NORMAL arrival state — and keying on the bare check classified it as
+      //    `insert-failed`, which skipped the start-and-wait below entirely and
+      //    silently defeated this whole helper. A usable checkpoint therefore
+      //    requires the boundary too, which is exactly what
+      //    `rebuildFromCheckpoint` needs (it reads `lastBoundary` at :411).
+      const hasCP = yield* checkpoint
+        .hasCheckpoint(input.sessionID)
+        .pipe(Effect.catch(() => Effect.succeed(false)))
+      const boundary = hasCP
+        ? yield* checkpoint.lastBoundary(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        : undefined
+      //    Predicate note: this MUST be the same truthiness test that
+      //    `rebuildFromCheckpoint` applies to the same value (`if (!boundary)`
+      //    at :413), NOT `boundary !== undefined`. `lastBoundary` reads a
+      //    nullable column and returned JS `null` for an unset watermark
+      //    (checkpoint.ts:1422 — its declared `MessageID | undefined` was an
+      //    unchecked cast), so `!== undefined` was true for EVERY session with a
+      //    file on disk and this guard degenerated into the bare
+      //    `hasCheckpoint` check it was written to replace.
+      if (hasCP && boundary) return "insert-failed" as const
+
+      // 3. No checkpoint → produce one on the spot. Reentrancy: the
+      //    isWriterRunning probe skips a redundant request, and
+      //    tryStartCheckpointWriter is itself safe under concurrency — it
+      //    returns "queued" instead of forking a second writer — so this can
+      //    never start two writers for one session even when reached from
+      //    successive runLoop iterations.
+      const writerRunning = yield* checkpoint
+        .isWriterRunning(input.sessionID)
+        .pipe(Effect.catch(() => Effect.succeed(false)))
+      if (!writerRunning) {
+        // promptOps is declared in TryStartCheckpointWriterInput but never read
+        // by the writer (it spawns as a subagent via spawnRef), so a stub
+        // suffices.
+        yield* checkpoint
+          .tryStartCheckpointWriter({
+            sessionID: input.sessionID,
+            model: { providerID: input.model.providerID, modelID: input.model.id },
+            promptOps: {} as never,
+          })
+          .pipe(Effect.catch(() => Effect.succeed<"started" | "queued" | "skipped">("skipped")))
+      }
+
+      if (input.onWaitingForWriter) yield* input.onWaitingForWriter
+
+      const writerOutcome = yield* checkpoint
+        .waitForWriter(input.sessionID)
+        .pipe(
+          Effect.timeout(input.writerWaitMs),
+          Effect.catch(() => Effect.succeed<"success" | "failure" | "no-writer">("failure")),
+        )
+      if (writerOutcome !== "success") return "writer-failed" as const
+
+      // 4. Writer wrote a checkpoint — rebuild from it.
+      if (yield* rebuildFromCheckpoint(input).pipe(Effect.catch(() => Effect.succeed(false))))
+        return "rebuilt" as const
+      return "insert-failed" as const
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -2262,6 +2393,50 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
     })
 
+    // A tool part is persisted as `running` the moment the tool STARTS (so the TUI
+    // can stream progress) and is only rewritten by the abort finalizer in
+    // `SessionProcessor.cleanup`. Every exit path that skips that finalizer — process
+    // kill, crash, dev restart — leaves the row `running` forever, so the transcript
+    // permanently shows tool calls that will never finish. Nothing else repairs them:
+    // the model-message converter (`MessageV2.toModelMessages`) synthesizes an
+    // `output-error` for `pending`/`running` parts so the provider never sees a
+    // dangling `tool_use`, but it never touches the persisted row.
+    //
+    // SAFETY — a CURRENTLY EXECUTING tool part is also `running`, so an unscoped
+    // "rewrite every running row" sweep would corrupt live turns. Two guards, both
+    // required, both narrow:
+    //   1. session status must be `idle`. `busy`/`retry` mean an active runner owns
+    //      this session, and a tool can only execute inside a runner's turn. This is
+    //      the same gate `sweepOrphanAssistants`' caller relies on, kept INSIDE the
+    //      function here because that is where the danger lives.
+    //   2. the MAIN slice only (`sessions.messages` default). `SessionProcessor` only
+    //      publishes status for the main slice (`if (isMain) status.set(...)`), so a
+    //      subagent slice can be executing tools while the session status reads
+    //      `idle` — its parts are out of scope.
+    const sweepOrphanToolParts = Effect.fn("SessionPrompt.sweepOrphanToolParts")(function* (sessionID: SessionID) {
+      if ((yield* status.get(sessionID)).type !== "idle") return
+      for (const m of yield* sessions.messages({ sessionID })) {
+        if (m.info.role !== "assistant") continue
+        for (const part of m.parts) {
+          if (part.type !== "tool") continue
+          if (part.state.status !== "pending" && part.state.status !== "running") continue
+          yield* sessions
+            .updatePart({ ...part, state: MessageV2.abortedToolState(part.state) })
+            .pipe(
+              Effect.catchCause((cause) =>
+                elog.warn("orphan-tool-part-update-failed", { sessionID, partID: part.id, cause }),
+              ),
+            )
+          yield* elog.info("orphan-tool-part-cleared", {
+            sessionID,
+            messageID: m.info.id,
+            partID: part.id,
+            tool: part.tool,
+          })
+        }
+      }
+    })
+
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID)
@@ -2272,6 +2447,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // so a fresh message is not rendered as stuck QUEUED behind it.
           const idle = (yield* status.get(input.sessionID)).type === "idle"
           yield* sweepOrphanAssistants(input.sessionID, idle)
+          // Same recovery point, same idleness argument: repair tool parts a killed
+          // process left stuck at `running`. Self-gated on idle (see the function).
+          //
+          // These two look mergeable into one message fetch. They are not:
+          // `sweepOrphanAssistants` reads EVERY slice (`agentID: "*"`) while this one
+          // reads the MAIN slice only, and that difference is load-bearing.
+          // `SessionProcessor` publishes status for the main slice alone, so a subagent
+          // slice can be mid-tool while the session status reads `idle` — scanning only
+          // main is what stops this sweep from rewriting a live subagent's `running`
+          // part. Sharing a fetch would mean taking the wider read and re-filtering
+          // here, which is precisely where that property would get lost. The cost is
+          // also smaller than it looks: this returns after one status lookup unless the
+          // session is genuinely idle.
+          yield* sweepOrphanToolParts(input.sessionID)
         }
         const message = yield* createUserMessage(input)
         yield* sessions.touch(input.sessionID)
@@ -2343,19 +2532,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // prose text instead of a structured tool_use). Local to runLoop so each
         // fresh user turn starts clean.
         let textToolCallRetries = 0
-        // Consecutive empty/no-op tool-call steps in this turn. Counts steps
-        // where the model "called a tool" with empty/invalid input, or produced
-        // no valid tool part and no substantive output at all (see isEmptyStep).
-        // A single non-empty step resets it. Escalates soft (remind → replan)
-        // then hard-halts once it exceeds EMPTY_STEP_MAX_RECOVERY, mirroring the
-        // text-ngram ladder. Local to runLoop so a fresh user turn starts clean.
-        let emptyStepStreak = 0
-        // Set true when a guard hard-halts the turn (currently the empty-step
-        // guard). A hard halt is terminal: it must break out immediately and
-        // NOT be re-entered by the goalGate ReAct gate, which would
-        // otherwise inject a fresh user turn and re-drive a still-degraded model
-        // into the same loop.
-        let hardHalt = false
         const resolvedAgentID = agentID ?? "main"
         const mcpContext: MCP.TurnContext = {
           sessionId: sessionID,
@@ -2874,90 +3050,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // Empty/no-op tool-call loop guard. Symmetric across main and fork
-        // branches, mirroring handleTextRepeat's soft→hard ladder but keyed on
-        // *empty steps* (empty/invalid tool input, or a fully empty terminal)
-        // rather than repeated text n-grams — the gap TEXT_NGRAM and
-        // stepSignature both miss (an empty tool call has no text to match and
-        // is dropped by stepSignature's undefined path).
-        //
-        // Returns:
-        //   "none"     — the step was NOT empty; streak reset, caller continues
-        //                normal classification.
-        //   "continue" — empty step, still within the soft-nudge budget; a
-        //                remind/replan reminder was injected, caller should loop.
-        //   "halt"     — empty streak exceeded EMPTY_STEP_MAX_RECOVERY; a
-        //                terminal error was published, caller must break.
-        const handleEmptyStep = Effect.fn("SessionPrompt.handleEmptyStep")(function* (input: {
-          lastUser: MessageV2.User
-          assistant: MessageV2.Assistant
-        }) {
-          // Never mask a genuine terminal outcome as an "empty loop": an errored
-          // step, a content-filter/error finish, or an already-resolved
-          // structured/summary step must fall through to its own classifier
-          // handler (writeContentFilterError / writeModelError / final). Those
-          // are terminal safety/error events, not a spinning no-op.
-          if (
-            input.assistant.error ||
-            input.assistant.summary ||
-            input.assistant.structured !== undefined ||
-            input.assistant.finish === "content-filter" ||
-            input.assistant.finish === "error"
-          ) {
-            return "none" as const
-          }
-          const parts = MessageV2.parts(input.assistant.id)
-          if (!isEmptyStep(parts)) {
-            emptyStepStreak = 0
-            return "none" as const
-          }
-          emptyStepStreak++
-          if (emptyStepStreak > EMPTY_STEP_MAX_RECOVERY) {
-            yield* slog.info("empty step: max recovery exceeded, terminating", { streak: emptyStepStreak })
-            hardHalt = true
-            // Discard the empty turn from request history so it can neither
-            // strand the conversation on an assistant prefill nor poison later
-            // context (toModelMessages skips a message whose info.error is set).
-            if (!input.assistant.error) {
-              input.assistant.error = new NamedError.Unknown({
-                message: `Empty tool call loop detected: ${emptyStepStreak} consecutive empty/no-op steps after ${EMPTY_STEP_MAX_RECOVERY} recovery attempts. Session terminated.`,
-              }).toObject()
-              yield* sessions.updateMessage(input.assistant)
-            }
-            yield* bus.publish(Session.Event.Error, {
-              sessionID,
-              error: new NamedError.Unknown({
-                message: `Empty tool call loop detected: ${emptyStepStreak} consecutive empty/no-op steps after ${EMPTY_STEP_MAX_RECOVERY} recovery attempts. Session terminated.`,
-              }).toObject(),
-            })
-            return "halt" as const
-          }
-          const recoveryText =
-            emptyStepStreak === 1 ? EMPTY_STEP_RECOVERY_REMIND : EMPTY_STEP_RECOVERY_REPLAN
-          const reentry = yield* sessions.updateMessage({
-            id: MessageID.ascending(),
-            role: "user" as const,
-            sessionID,
-            agentID: input.lastUser.agentID,
-            agent: input.lastUser.agent,
-            model: input.lastUser.model,
-            tools: input.lastUser.tools,
-            format: input.lastUser.format,
-            time: { created: Date.now() },
-          })
-          yield* sessions.updatePart({
-            id: PartID.ascending(),
-            messageID: reentry.id,
-            sessionID,
-            type: "text",
-            synthetic: true,
-            text: recoveryText,
-          } satisfies MessageV2.TextPart)
-          yield* slog.info("empty step: recovery injected", { streak: emptyStepStreak })
-          return "continue" as const
-        })
-
-
         // content-filter is terminal on first occurrence: re-sending the same
         // turn would just get filtered again, so there is no nudge / counter.
         // Write a user-visible error (rendered via the session.error toast) and
@@ -3380,34 +3472,56 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             // Main-agent overflow: insert a checkpoint boundary marker (never
             // deletes DB messages) so the next iteration rebuilds from the
-            // freshest checkpoint. Shared with the manual `/rebuild` command via
-            // rebuildFromCheckpoint so logic/boundary conditions can't drift.
-            // Falls back to compaction only when no boundary can be produced.
-            const inserted = yield* rebuildFromCheckpoint({
+            // freshest checkpoint. When NO checkpoint exists yet this now starts
+            // a writer and waits for it (bounded) rather than degrading
+            // immediately — the same on-the-spot behaviour the manual /rebuild
+            // command has, via the shared rebuildEnsuringCheckpoint helper so
+            // logic/boundary conditions can't drift.
+            const attempt: RebuildAttempt = yield* rebuildEnsuringCheckpoint({
               sessionID,
               msgs,
               agentID: lastUser.agentID,
               agent: lastUser.agent,
               model: { providerID: model.providerID, id: model.id },
+              writerWaitMs: AUTO_WRITER_WAIT_MS,
+              // The turn is mid-flight, so explain the stall: without this the
+              // TUI would sit on a bare spinner for minutes with no reason.
+              onWaitingForWriter: status
+                .set(sessionID, { type: "busy", message: "Writing checkpoint\u2026" })
+                .pipe(Effect.catch(() => Effect.void)),
             })
-            if (inserted) {
+            if (attempt === "rebuilt") {
               skipOverflowCheck = true
               continue
             }
 
-            // F39: no checkpoint — fall back to compaction (LLM-driven lossy summary).
-            // Better than mechanical trim: preserves semantic content via summary.
-            yield* compaction
-              .create({
-                sessionID,
-                agent: lastUser.agent,
-                model: { providerID: model.providerID, modelID: model.id },
-                auto: true,
-                agentID: lastUser.agentID,
-              })
-              .pipe(Effect.ignore)
-            skipOverflowCheck = true
-            continue
+            // A writer was started and awaited above (AUTO_WRITER_WAIT_MS) and
+            // still produced nothing — the ONE condition that may compact.
+            if (attempt === "writer-failed") {
+              // THE single compaction fallback: no checkpoint existed AND the
+              // writer failed / never ran / the bound expired. Note this is a
+              // bare boundary insert, not an LLM summary — everything before it
+              // is dropped unsummarized (compaction.ts:499, message-v2.ts:1037)
+              // — which is exactly why we tried to write a checkpoint first.
+              yield* compaction
+                .create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: { providerID: model.providerID, modelID: model.id },
+                  auto: true,
+                  agentID: lastUser.agentID,
+                })
+                .pipe(Effect.ignore)
+              skipOverflowCheck = true
+              continue
+            }
+
+            // "insert-failed": a checkpoint DOES exist, so compaction is not
+            // permitted here — it would amputate history we hold a usable
+            // checkpoint for. Nothing freed context, so do NOT `continue` into
+            // an identical overflow check; fall through and let the model call
+            // proceed. The provider-signalled overflow handler below is the
+            // backstop if the request is actually rejected.
           }
           skipOverflowCheck = false
 
@@ -3665,14 +3779,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "break" as const
               }
 
-              // Empty/no-op tool-call loop guard (fork branch). Intercept before
-              // classify would `continue` an empty tool-calls step: soft-nudge
-              // within budget, hard-halt once exceeded. A non-empty step returns
-              // "none" and falls through to normal classification.
-              const forkEmptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
-              if (forkEmptyStep === "halt") return "break" as const
-              if (forkEmptyStep === "continue") return "continue" as const
-
               const forkClassification = classifyAssistantStep({
                 phase: "after-process",
                 lastUser,
@@ -3892,14 +3998,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               return "break" as const
             }
 
-            // Empty/no-op tool-call loop guard (main branch). Intercept before
-            // classify would `continue` an empty tool-calls step: soft-nudge
-            // within budget, hard-halt once exceeded. A non-empty step returns
-            // "none" and falls through to normal classification.
-            const emptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
-            if (emptyStep === "halt") return "break" as const
-            if (emptyStep === "continue") return "continue" as const
-
             const classification = classifyAssistantStep({
               phase: "after-process",
               lastUser,
@@ -3958,30 +4056,37 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
 
               // Main-agent provider-signalled overflow: prefer rebuild over
-              // compaction. Shared with the manual `/rebuild` command via
-              // rebuildFromCheckpoint (does not block on the writer; uses the
-              // on-disk checkpoint). Fall back to compaction only when no
-              // boundary can be produced.
-              const inserted2 = yield* rebuildFromCheckpoint({
+              // compaction, via the same shared rebuildEnsuringCheckpoint helper
+              // the token-threshold path and manual /rebuild use — so the
+              // compaction fallback stays ONE condition, not three lookalikes.
+              const attempt2: RebuildAttempt = yield* rebuildEnsuringCheckpoint({
                 sessionID,
                 msgs,
                 agentID: lastUser.agentID,
                 agent: lastUser.agent,
                 model: { providerID: model.providerID, id: model.id },
+                writerWaitMs: AUTO_WRITER_WAIT_MS,
+                onWaitingForWriter: status
+                  .set(sessionID, { type: "busy", message: "Writing checkpoint\u2026" })
+                  .pipe(Effect.catch(() => Effect.void)),
               })
-              if (inserted2) return "continue" as const
+              if (attempt2 === "rebuilt") return "continue" as const
 
-              // F39: no checkpoint — fall back to compaction (LLM-driven lossy summary).
-              yield* compaction
-                .create({
-                  sessionID,
-                  agent: lastUser.agent,
-                  model: { providerID: model.providerID, modelID: model.id },
-                  auto: true,
-                  overflow: true,
-                  agentID: lastUser.agentID,
-                })
-                .pipe(Effect.ignore)
+              // Same as above: the writer ran and failed — not "no checkpoint".
+              if (attempt2 === "writer-failed") {
+                // THE single compaction fallback (see the token-threshold site).
+                yield* compaction
+                  .create({
+                    sessionID,
+                    agent: lastUser.agent,
+                    model: { providerID: model.providerID, modelID: model.id },
+                    auto: true,
+                    overflow: true,
+                    agentID: lastUser.agentID,
+                  })
+                  .pipe(Effect.ignore)
+              }
+              // "insert-failed" → a checkpoint exists; must not compact.
             }
             return "continue" as const
           }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
@@ -4047,9 +4152,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (outcome === "break") {
-            // A hard halt is terminal — skip the ReAct re-entry gates so a
-            // degraded model can't be re-driven into the same empty loop.
-            if (hardHalt) break
             if (yield* goalGate(lastUser)) continue
             break
           }
@@ -4176,41 +4278,131 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         yield* goal.set(input.sessionID, condition)
       }
 
-      // /rebuild — manually rebuild the conversation context now, from the
-      // latest checkpoint. Reuses the SAME rebuildFromCheckpoint step as the
-      // automatic overflow path (identical logic + boundary conditions), so a
-      // user-triggered rebuild behaves exactly like an auto one: it inserts a
-      // checkpoint boundary at the watermark (recent messages after it are kept
-      // verbatim; earlier ones collapse to the checkpoint summary on the next
-      // turn). If no usable checkpoint exists yet, tell the user rather than
-      // silently doing nothing — the first checkpoint has to be produced by
-      // normal turns before there is anything to rebuild from.
+      // /rebuild — manually rebuild the conversation context ON THE SPOT,
+      // from the latest checkpoint. Implements the 3-case checkpoint-freshness
+      // semantics:
+      //   1. Usable checkpoint exists, no writer running → rebuild immediately.
+      //   2. No usable checkpoint → start a writer and wait for it, then rebuild.
+      //   3. Checkpoint exists + writer in-flight → wait (with timeout), rebuild
+      //      with the fresher checkpoint if it arrives, else fall back to existing.
+      // Cases 1-3 live in the shared rebuildEnsuringCheckpoint helper, which the
+      // auto context-overflow paths use too, so the manual and automatic
+      // behaviours cannot drift and there is exactly ONE compaction fallback
+      // condition (no checkpoint AND the writer failed) in this file.
+      //
+      // Manual /rebuild mirrors the AUTO rebuild/compaction path exactly: it
+      // inserts the legitimate rebuild BOUNDARY (a role:"user" message carrying
+      // a `checkpoint` part, via rebuildFromCheckpoint → insertRebuildBoundary)
+      // and then lets the session settle — WITHOUT fabricating a second,
+      // standalone user turn. The auto path (~prompt.ts:3205/3778) `continue`s
+      // the runLoop because it has a PENDING user message to answer; a manual
+      // /rebuild is a user-initiated maintenance action with NO pending
+      // question, so after inserting the boundary it simply returns to idle
+      // (no model turn, no auto-reply).
+      //
+      // The outcome ("context rebuilt" / "compacted instead because the writer
+      // failed" / "checkpoint written but rebuild failed") is surfaced to the
+      // user through the SessionStatus / Bus status channel — the same
+      // busy-status mechanism that drives "Rebuilding context…" /
+      // "Writing checkpoint…" — NOT through a persisted synthetic user message.
+      // The busy status is set BEFORE any work so the TUI spinner lights up
+      // immediately; because the runLoop is never entered, its onIdle won't
+      // clear busy status, so every return path clears idle explicitly.
       if (input.command === Command.Default.REBUILD) {
         const msgs = yield* sessions.messages({ sessionID: input.sessionID, agentID: "main" })
         const lastUser = msgs.findLast((m) => m.info.role === "user")
         const model = yield* lastModel(input.sessionID)
-        const inserted = yield* rebuildFromCheckpoint({
+
+        // Emit the terminal outcome on the status channel, then return to idle.
+        // Returns the message the handler should hand back (never a fabricated
+        // user turn): the freshly-inserted boundary on success, else the
+        // existing last user message so callers still receive a WithParts.
+        const settle = Effect.fn("SessionPrompt.rebuild.settle")(function* (message: string) {
+          yield* status.set(input.sessionID, { type: "busy", message }).pipe(Effect.catch(() => Effect.void))
+          yield* status.set(input.sessionID, { type: "idle" }).pipe(Effect.catch(() => Effect.void))
+        })
+        const compactedInsteadMsg =
+          "No checkpoint could be written (the checkpoint writer failed), so the context was compacted instead — earlier messages were dropped rather than rebuilt from a checkpoint."
+        const rebuildFailedMsg =
+          "A checkpoint was written but the context could not be rebuilt from it. Context is unchanged and nothing was compacted — retry /rebuild, or report this if it repeats."
+        const rebuiltMsg =
+          "Context rebuilt from the latest checkpoint. Recent messages are preserved; earlier context is now summarized."
+
+        // Set busy status so the TUI shows a spinner while we wait on the
+        // writer (cases 2/3) or assemble context (case 1).
+        yield* status.set(input.sessionID, { type: "busy", message: "Rebuilding context\u2026" }).pipe(
+          Effect.catch(() => Effect.void),
+        )
+
+        // Cases 1-3 all run through the shared rebuildEnsuringCheckpoint helper:
+        // it rebuilds from an existing checkpoint, or — on a cold session — spawns
+        // a writer, waits for it (bounded), and rebuilds from the fresh
+        // checkpoint. That is the user-decided semantics: /rebuild on a cold
+        // session produces the first checkpoint on the spot rather than deferring.
+        const attempt: RebuildAttempt = yield* rebuildEnsuringCheckpoint({
           sessionID: input.sessionID,
           msgs,
           agentID: lastUser?.info.agentID ?? "main",
           agent: agentName,
           model: { providerID: model.providerID, id: model.modelID },
-        }).pipe(Effect.catch(() => Effect.succeed(false)))
-        return yield* prompt({
-          sessionID: input.sessionID,
-          messageID: input.messageID,
-          agent: agentName,
-          parts: [
-            {
-              type: "text",
-              text: inserted
-                ? "Context rebuilt from the latest checkpoint. Recent messages are preserved; earlier context is now summarized."
-                : "No checkpoint is available to rebuild from yet — continue the conversation and a checkpoint will be written automatically.",
-              synthetic: true,
-            },
-          ],
-          noReply: true,
-        })
+          writerWaitMs: MANUAL_WRITER_WAIT_MS,
+          onWaitingForWriter: status
+            .set(input.sessionID, { type: "busy", message: "Writing checkpoint\u2026" })
+            .pipe(Effect.catch(() => Effect.void)),
+        }).pipe(Effect.catch(() => Effect.succeed("insert-failed" as const)))
+
+        // A writer was started and awaited above (MANUAL_WRITER_WAIT_MS) and
+        // still produced nothing — only then may /rebuild degrade to compaction.
+        if (attempt === "writer-failed") {
+          // No checkpoint AND the writer genuinely failed / never ran / the bound
+          // expired — the ONE fallback condition, shared with the auto overflow
+          // paths. An earlier revision of this branch deliberately did NOT
+          // compact here, reasoning that /rebuild means "rebuild from a
+          // checkpoint" so substituting a lossy summary would misreport what
+          // happened. The user overruled that tradeoff: if the writer genuinely
+          // failed, a truncating compaction beats doing nothing. We keep the
+          // report honest by naming the substitution on the status channel
+          // instead of silently swapping the mechanism, and — per the branch's
+          // existing noReply decision (3244ca732) — fabricate neither an
+          // assistant reply nor a synthetic user turn.
+          yield* compaction
+            .create({
+              sessionID: input.sessionID,
+              agent: agentName,
+              model: { providerID: model.providerID, modelID: model.modelID },
+              // Not user-requested: the user asked for a rebuild, the system
+              // chose this degradation.
+              auto: true,
+              agentID: lastUser?.info.agentID ?? "main",
+            })
+            .pipe(Effect.ignore)
+          yield* settle(compactedInsteadMsg)
+          return lastUser ?? msgs[msgs.length - 1]!
+        }
+
+        if (attempt === "insert-failed") {
+          // A checkpoint EXISTS but the boundary insert refused (e.g.
+          // renderRebuildContext returned empty — degraded state). NOT a
+          // fallback case: compacting would drop history that a usable
+          // checkpoint was available for. Report the degraded state accurately
+          // and return to idle.
+          yield* settle(rebuildFailedMsg)
+          return lastUser ?? msgs[msgs.length - 1]!
+        }
+
+        // Boundary inserted (Step A — the shared, correct mechanism). A MANUAL
+        // /rebuild is a user action whose whole intent is to free/rebuild the
+        // context: the user asked no question, so the model must NOT reply and
+        // NO second user turn is fabricated. We surface the "context rebuilt"
+        // outcome on the status channel and return the boundary message itself
+        // (the newest role:"user" message carrying a checkpoint part), then go
+        // idle. The runLoop is never entered — mirroring the transparent
+        // boundary insertion the auto/compaction paths perform, minus their
+        // pending-message `continue`.
+        yield* settle(rebuiltMsg)
+        const after = yield* sessions.messages({ sessionID: input.sessionID, agentID: "main" })
+        const boundaryMessage = after.findLast((m) => m.parts.some((p) => p.type === "checkpoint"))
+        return boundaryMessage ?? lastUser ?? after[after.length - 1]!
       }
 
       const raw = input.arguments.match(argsRegex) ?? []
@@ -4344,6 +4536,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       command,
       resolvePromptParts,
       sweepOrphanAssistants,
+      sweepOrphanToolParts,
       predict,
     })
     sessionPromptRef.current = { loop: impl.loop }
