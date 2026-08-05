@@ -1956,17 +1956,40 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       providerID: ProviderID,
       modelID: ModelID,
       sessionID: SessionID,
+      terminalUser?: MessageV2.User,
     ) {
       const exit = yield* provider.getModel(providerID, modelID).pipe(Effect.exit)
       if (Exit.isSuccess(exit)) return exit.value
       const err = Cause.squash(exit.cause)
       if (Provider.ModelNotFoundError.isInstance(err)) {
         const hint = err.data.suggestions?.length ? ` Did you mean: ${err.data.suggestions.join(", ")}?` : ""
+        const error = new NamedError.Unknown({
+          message: `Model not found: ${err.data.providerID}/${err.data.modelID}.${hint}`,
+        }).toObject()
+        if (terminalUser) {
+          const ctx = yield* InstanceState.context
+          const now = Date.now()
+          yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            sessionID,
+            parentID: terminalUser.id,
+            agentID: terminalUser.agentID,
+            role: "assistant",
+            mode: terminalUser.agent,
+            agent: terminalUser.agent,
+            variant: terminalUser.model.variant,
+            path: { cwd: ctx.directory, root: ctx.worktree },
+            cost: 0,
+            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            modelID,
+            providerID,
+            time: { created: now, completed: now },
+            error,
+          })
+        }
         yield* bus.publish(Session.Event.Error, {
           sessionID,
-          error: new NamedError.Unknown({
-            message: `Model not found: ${err.data.providerID}/${err.data.modelID}.${hint}`,
-          }).toObject(),
+          error,
         })
       }
       return yield* Effect.failCause(exit.cause)
@@ -3140,6 +3163,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          const usageRecovered =
+            !!lastFinished &&
+            msgs.some(
+              (msg) =>
+                msg.info.id > lastFinished.id &&
+                msg.parts.some((part) => part.type === "checkpoint" || part.type === "compaction"),
+            )
 
           // Per-user-message active recall reminder. Once the session has
           // any memory artifacts (memory dir populated OR tasks recorded),
@@ -3296,9 +3326,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
           }
 
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID, lastUser)
           lastModelForPrune = model
-          lastFinishedForPrune = lastFinished
+          lastFinishedForPrune = usageRecovered ? undefined : lastFinished
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
@@ -3389,7 +3419,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // based on the latest completed assistant message's tokens. These
           // thresholds only keep the checkpoint fresh; `overflowCheck` below is
           // the single trigger for rebuilding the active context.
-          if (!skipOverflowCheck && !isBoundedComputation && lastFinished && lastFinished.tokens) {
+          if (!skipOverflowCheck && !usageRecovered && !isBoundedComputation && lastFinished && lastFinished.tokens) {
             const fireOps = yield* ops()
             yield* prune
               .fireCheckpoints({
@@ -3404,6 +3434,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           if (
             !skipOverflowCheck &&
+            !usageRecovered &&
             !isBoundedComputation &&
             lastFinished &&
             lastFinished.summary !== true &&
@@ -3794,6 +3825,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     agentID: lastUser.agentID,
                   })
                   .pipe(Effect.ignore)
+                skipOverflowCheck = true
               }
               return "continue" as const
             }
@@ -4014,6 +4046,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     agentID: lastUser.agentID,
                   })
                   .pipe(Effect.ignore)
+                skipOverflowCheck = true
                 return "continue" as const
               }
 
@@ -4032,7 +4065,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   .set(sessionID, { type: "busy", message: "Writing checkpoint\u2026" })
                   .pipe(Effect.catch(() => Effect.void)),
               })
-              if (attempt2 === "rebuilt") return "continue" as const
+              if (attempt2 === "rebuilt") {
+                skipOverflowCheck = true
+                return "continue" as const
+              }
 
               // Same as above: the writer ran and failed — not "no checkpoint".
               if (attempt2 === "writer-failed") {
@@ -4047,6 +4083,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     agentID: lastUser.agentID,
                   })
                   .pipe(Effect.ignore)
+                skipOverflowCheck = true
               }
               // "insert-failed" → a checkpoint exists; must not compact.
             }
