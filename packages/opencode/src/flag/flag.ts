@@ -141,6 +141,7 @@ export const Flag = {
   MIMOCODE_DISABLE_CLAUDE_CODE_COMMANDS: truthy("MIMOCODE_DISABLE_CLAUDE_CODE_COMMANDS"),
   MIMOCODE_DISABLE_CLAUDE_CODE_SKILLS,
   MIMOCODE_DISABLE_EXTERNAL_SKILLS,
+  MIMOCODE_DISABLE_AGENTS_SKILLS: MIMOCODE_DISABLE_EXTERNAL_SKILLS || truthy("MIMOCODE_DISABLE_AGENTS_SKILLS"),
   MIMOCODE_DISABLE_CODEX_SKILLS: MIMOCODE_DISABLE_EXTERNAL_SKILLS || truthy("MIMOCODE_DISABLE_CODEX_SKILLS"),
   MIMOCODE_DISABLE_OPENCODE_SKILLS: MIMOCODE_DISABLE_EXTERNAL_SKILLS || truthy("MIMOCODE_DISABLE_OPENCODE_SKILLS"),
 
@@ -183,6 +184,12 @@ export const Flag = {
   // Defaults to false. Set MIMOCODE_ENABLE_TRY_BEST_HANDOFF=true (or 1) to
   // enable try-best loop detection, automatic turn pausing, and handoff UI.
   MIMOCODE_ENABLE_TRY_BEST_HANDOFF: truthy("MIMOCODE_ENABLE_TRY_BEST_HANDOFF"),
+
+  // Defaults to false. Opt in to append runtime-derived environment and
+  // instruction-file content to the model's system prompt.
+  get MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT() {
+    return truthy("MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT")
+  },
 
   // Defaults to false. The edit tool does pure exact-string matching with
   // explicit error signals. Set MIMOCODE_ENABLE_FUZZY_EDIT=true to opt into the

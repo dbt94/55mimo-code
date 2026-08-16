@@ -120,11 +120,10 @@ import {
   type McpToolSearchMetadata,
 } from "@/tool/mcp-tool-search"
 import { isMcpToolSearchEnabled } from "@/tool/gpt"
+import { isSkillCatalogReminder, SKILL_CATALOG_REMINDER_MARKER } from "./skill-catalog"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
-
-const SKILL_CATALOG_REMINDER_MARKER = "Skills available in this session:"
 
 // Recall-reminder hints, rendered in each tool's configured invocation style so
 // shell-mode sessions never see a JSON-shaped example (which primes models to
@@ -312,12 +311,14 @@ export const layer = Layer.effect(
         const captureSession = yield* sessions.get(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!captureSession) return empty
         const [env, instructions] = yield* Effect.all([
-          sys.environment(model, captureSession.time.created),
+          Flag.MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT
+            ? sys.environment(model, captureSession.time.created)
+            : Effect.succeed([]),
           instruction.system().pipe(Effect.orDie),
         ])
         // (checkpoint-writer never requests json_schema output, so STRUCTURED_OUTPUT_SYSTEM_PROMPT
         // is not included; parent's runLoop adds it conditionally based on user.format)
-        const additions = [...env, ...instructions.content]
+        const additions = Flag.MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT ? [...env, ...instructions.content] : []
         const prefix = yield* buildLLMRequestPrefix({
           sessionID: input.sessionID,
           agent: ag,
@@ -928,7 +929,7 @@ export const layer = Layer.effect(
         : undefined
       const existingCatalogs = input.messages.flatMap((message) =>
         message.parts.flatMap((part) =>
-          part.type === "text" && part.synthetic && !part.ignored && part.text.includes(SKILL_CATALOG_REMINDER_MARKER)
+          part.type === "text" && part.synthetic && !part.ignored && isSkillCatalogReminder(part.text)
             ? [{ message, part }]
             : [],
         ),
@@ -1477,7 +1478,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       const localToolNames = new Set(Object.keys(tools))
-      const mcpTools = Object.entries(yield* mcp.tools(input.mcpContext))
+      const mcpTools = Object.entries(yield* mcp.tools(input.mcpContext)).toSorted(([a], [b]) => a.localeCompare(b))
       const agentToolAllowlist = input.agent.toolAllowlist ? new Set(input.agent.toolAllowlist) : undefined
       const disabledMcpTools = Permission.disabled(
         mcpTools.map(([key]) => key),
@@ -4007,7 +4008,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
 
             const [env, instructions] = yield* Effect.all([
-              sys.environment(model, session.time.created),
+              Flag.MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT
+                ? sys.environment(model, session.time.created)
+                : Effect.succeed([]),
               instruction.system().pipe(Effect.orDie),
             ])
             // Surface which instruction files (CLAUDE.md, AGENTS.md, ...) were loaded.
@@ -4021,8 +4024,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
             }
             const additions = [
-              ...env,
-              ...instructions.content,
+              ...(Flag.MIMOCODE_ENABLE_DYNAMIC_SYSTEM_PROMPT ? [...env, ...instructions.content] : []),
               ...(format.type === "json_schema" ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : []),
             ]
             // Note: `buildLLMRequestPrefix` also returns a `tools` field, but we
