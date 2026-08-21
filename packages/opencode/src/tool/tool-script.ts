@@ -28,6 +28,34 @@ const MAX_LOG_BYTES = 64 * 1024
 const MAX_CODE_BYTES = 128 * 1024
 const MAX_FILE_BYTES = 10 * 1024 * 1024
 const TRACE_TAIL_ENTRIES = 20
+const EXEC_COMMAND_DEFAULT_YIELD_TIME_MS = 10_000
+
+const ExecCommandParameters = z.object({
+  cmd: z.string().describe("Shell command to execute."),
+  yield_time_ms: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(`Wait budget in milliseconds before the command is terminated. Defaults to ${EXEC_COMMAND_DEFAULT_YIELD_TIME_MS} ms.`),
+  workdir: z
+    .string()
+    .optional()
+    .describe("Working directory for the command. Defaults to the current session directory."),
+})
+
+const EXEC_COMMAND_DESCRIPTION =
+  "Runs a shell command through the permission-gated bash executor. `cmd` is required; `yield_time_ms` is optional and defaults to 10000 ms."
+
+function execCommandArgs(args: unknown) {
+  const input = ExecCommandParameters.parse(args)
+  return {
+    command: input.cmd,
+    timeout: input.yield_time_ms ?? EXEC_COMMAND_DEFAULT_YIELD_TIME_MS,
+    workdir: input.workdir,
+    description: input.cmd.length > 80 ? `${input.cmd.slice(0, 77)}...` : input.cmd,
+  }
+}
 
 /** JSON Schema (zod v4 toJSONSchema output) → compact TS type text. Best-effort:
  * anything unrecognized renders as `unknown`, which is safe for declarations. */
@@ -69,8 +97,11 @@ function schemaToTs(schema: any): string {
 /** Render the `tools` API declaration block appended to the tool description. */
 export function renderToolScriptDeclarations(defs: Tool.Def[]): string {
   const aliases = new Set(Object.keys(TOOL_SCRIPT_ALIASES))
+  const aliasTargets = new Set<string>(Object.values(TOOL_SCRIPT_ALIASES))
   const lines = defs
-    .filter((def) => !TOOL_SCRIPT_EXCLUDED.has(def.id) && !aliases.has(def.id))
+    .filter(
+      (def) => !TOOL_SCRIPT_EXCLUDED.has(def.id) && !aliases.has(def.id) && !aliasTargets.has(def.id),
+    )
     .map((def) => {
       const summary = def.description.split("\n").find((l) => l.trim()) ?? ""
       const input = schemaToTs(z.toJSONSchema(def.parameters))
@@ -79,8 +110,10 @@ export function renderToolScriptDeclarations(defs: Tool.Def[]): string {
   const aliasLines = Object.entries(TOOL_SCRIPT_ALIASES).flatMap(([alias, target]) => {
     const def = defs.find((item) => item.id === target)
     if (!def) return []
-    const summary = def.description.split("\n").find((line) => line.trim()) ?? ""
-    const input = schemaToTs(z.toJSONSchema(def.parameters))
+    const summary = alias === "exec_command"
+      ? EXEC_COMMAND_DESCRIPTION
+      : def.description.split("\n").find((line) => line.trim()) ?? ""
+    const input = schemaToTs(z.toJSONSchema(alias === "exec_command" ? ExecCommandParameters : def.parameters))
     return [`  /** Alias for ${target}. ${summary.trim().slice(0, 180)} */\n  ${alias}(input: ${input}): Promise<ToolResult>`]
   })
   return [
@@ -89,10 +122,10 @@ export function renderToolScriptDeclarations(defs: Tool.Def[]): string {
     "declare const tools: {",
     ...lines,
     ...aliasLines,
-    "  /** Request-authorized MCP tools are callable by exact catalog name, normally mcp__<server>__<tool>. */",
+    "  /** Request-authorized MCP tools are callable by their exact ALL_TOOLS catalog name. */",
     "  [mcpToolName: string]: (input: Record<string, unknown>) => Promise<ToolResult>",
     "}",
-    "/** Every tool callable in this execution. Filter by name to discover MCP tools without mcp_tool_search. */",
+    "/** Every tool callable in this execution. Search names and descriptions to discover tools without mcp_tool_search. */",
     "declare const ALL_TOOLS: ReadonlyArray<{ name: string; description: string }>",
     "// Raw file IO for machine-to-machine data (pipelines across executions).",
     "declare const files: {",
@@ -392,11 +425,16 @@ export const ToolScriptTool = Tool.define(
             Object.entries(mcpTools).filter(([id]) => !byId.has(id) && (!whitelist || whitelist.has(id))),
           )
           const allTools = [
-            ...[...byId.values()].map((def) => ({ name: def.id, description: def.description })),
+            ...[...byId.values()]
+              .filter((def) => !Object.values(TOOL_SCRIPT_ALIASES).some((target) => target === def.id))
+              .map((def) => ({ name: def.id, description: def.description })),
             ...Object.entries(TOOL_SCRIPT_ALIASES).flatMap(([name, target]) => {
               const def = byId.get(target)
               if (!def) return []
-              return [{ name, description: `Alias for ${target}. ${def.description}` }]
+              return [{
+                name,
+                description: name === "exec_command" ? EXEC_COMMAND_DESCRIPTION : `Alias for ${target}. ${def.description}`,
+              }]
             }),
             ...[...mcpById.entries()].map(([name, tool]) => ({ name, description: tool.description ?? "" })),
           ]
@@ -481,6 +519,7 @@ export const ToolScriptTool = Tool.define(
             const def = byId.get(alias ?? id)
             const mcpDef = def ? undefined : mcpById.get(id)
             if (!def && !mcpDef) return Promise.reject(new Error(`unknown tool: ${id}`))
+            const toolArgs = id === "exec_command" ? execCommandArgs(args) : args
             calls++
             if (calls > maxToolCalls)
               return Promise.reject(new Error(`tool call budget exceeded (${maxToolCalls} per execution)`))
@@ -505,7 +544,7 @@ export const ToolScriptTool = Tool.define(
               Effect.tryPromise({
                 try: () =>
                   Promise.resolve(
-                    tool.execute!(args ?? {}, {
+                    tool.execute!(toolArgs ?? {}, {
                       toolCallId: subCtx.callID,
                       messages: [],
                       abortSignal: ctx.abort,
@@ -533,7 +572,7 @@ export const ToolScriptTool = Tool.define(
               )
             return withSlot(() =>
               bridge
-                .promise(def ? def.execute(args, subCtx) : executeMcp(mcpDef!))
+                .promise(def ? def.execute(toolArgs, subCtx) : executeMcp(mcpDef!))
                 .then(
                   (result) => {
                     trace.push({ name: id, status: "success", durationMs: Date.now() - start })

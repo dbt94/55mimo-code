@@ -109,7 +109,6 @@ import { resolveInvocationStyle, type ToolStyleConfig } from "../tool/invocation
 import { ToolResultError } from "../tool/result-error"
 import { RecoverableError } from "../tool/recoverable"
 import { shouldAutoDream, shouldAutoDistill, DREAM_TASK, DISTILL_TASK, AUTO_DREAM_TITLE, AUTO_DISTILL_TITLE } from "./auto-dream"
-import { skillSearchReminderForSession } from "./skill-search-reminder"
 import {
   createMcpToolSearchCatalog,
   mcpToolCatalogBudget,
@@ -120,7 +119,7 @@ import {
   type McpToolSearchMetadata,
 } from "@/tool/mcp-tool-search"
 import { isMcpToolSearchEnabled, usesGPTToolset } from "@/tool/gpt"
-import { GPT_TOOL_SCRIPT_ONLY } from "@/tool/tool-script-ref"
+import { GPT_TOP_LEVEL_TOOLS } from "@/tool/tool-script-ref"
 import { isSkillCatalogReminder, SKILL_CATALOG_REMINDER_MARKER } from "./skill-catalog"
 
 // @ts-ignore
@@ -925,7 +924,7 @@ export const layer = Layer.effect(
         ...input.agent,
         permission: Agent.runtimePermission(input.agent, input.session.permission),
       }
-      const skills = yield* sys.skills(runtimeAgent, input.model)
+      const skills = yield* sys.skills(runtimeAgent)
       const catalogText = skills
         ? ["<system-reminder>", SKILL_CATALOG_REMINDER_MARKER, skills, "</system-reminder>"].join("\n")
         : undefined
@@ -953,21 +952,6 @@ export const layer = Layer.effect(
           sessionID: userMessage.info.sessionID,
           type: "text",
           text: catalogText,
-          synthetic: true,
-        })
-        userMessage.parts.push(part)
-      }
-
-      // Search reminders apply only to eligible direct user sessions and models.
-      // They advise the primary agent when to search; the model still decides whether to call.
-      const reminder = skillSearchReminderForSession(input)
-      if (reminder) {
-        const part = yield* sessions.updatePart({
-          id: PartID.ascending(),
-          messageID: userMessage.info.id,
-          sessionID: userMessage.info.sessionID,
-          type: "text",
-          text: reminder,
           synthetic: true,
         })
         userMessage.parts.push(part)
@@ -1077,7 +1061,7 @@ ${entries}
                 ? `SKILL.md for [${toLoad.join(", ")}] has been auto-loaded above.`
                 : ""
               const overflowHint = overflow.length > 0
-                ? `For [${overflow.join(", ")}], use the Skill tool to load them on demand.`
+                ? `SKILL.md for [${overflow.join(", ")}] was not auto-loaded; load each through the current skill tool surface before using it.`
                 : ""
               const part = yield* sessions.updatePart({
                 id: PartID.ascending(),
@@ -1283,10 +1267,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         return new Set(actor.tools)
       })
       const whitelist = yield* whitelistFor()
+      const useGPTTools = usesGPTToolset(input.model.id)
       const execAllowedByWhitelist =
-        usesGPTToolset(input.model.id) &&
+        useGPTTools &&
         !!whitelist &&
-        [...whitelist].some((toolID) => GPT_TOOL_SCRIPT_ONLY.has(toolID))
+        [...whitelist].some((toolID) => !GPT_TOP_LEVEL_TOOLS.has(toolID))
       // Whether a permission ask must be non-interactive (fail clean, never hang):
       // true for system-spawned actors (checkpoint-writer/dream/distill) AND any
       // background actor such as compose workflow subagents (spawned as "general"
@@ -1380,7 +1365,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         autoApproveDelete: () => permission.autoApproveDelete(),
       })
 
-      for (const item of yield* registry.tools({
+      // Keep every authorized definition in the AI SDK tool map so an unadvertised
+      // direct call still resolves. `activeTools` below is the separate provider-
+      // facing schema allowlist and stays compact in Codex mode.
+      for (const item of yield* registry.registered({
         modelID: input.model.id,
         providerID: input.model.providerID,
         agent: input.agent,
@@ -1486,7 +1474,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             )
           },
         })
-        if (item.id !== MCP_TOOL_SEARCH_ID) activeTools.add(item.id)
+        if (item.id !== MCP_TOOL_SEARCH_ID && (!useGPTTools || GPT_TOP_LEVEL_TOOLS.has(item.id))) {
+          activeTools.add(item.id)
+        }
       }
 
       const localToolNames = new Set(Object.keys(tools))
@@ -1520,7 +1510,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             parameters: transformed as unknown as JSONObject,
           })
         }
-        if (searchable && !useMcpToolSearch && input.model.capabilities.toolcall) activeTools.add(key)
+        if (searchable && !useMcpToolSearch && input.model.capabilities.toolcall && !useGPTTools) {
+          activeTools.add(key)
+        }
         const executeMcp = (
           args: Parameters<typeof execute>[0],
           opts: Parameters<typeof execute>[1],
@@ -1723,6 +1715,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
 
       if (
+        !useGPTTools &&
         useMcpToolSearch &&
         input.model.capabilities.toolcall &&
         mcpCatalog.current.entries.length > 0 &&
@@ -1730,7 +1723,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       ) {
         activeTools.add(MCP_TOOL_SEARCH_ID)
       }
-      loadedMcpTools.forEach((name) => activeTools.add(name))
+      if (!useGPTTools) loadedMcpTools.forEach((name) => activeTools.add(name))
 
       // MCP Tool Search keeps full schemas out of the outer model tool list;
       // it is a context-budget optimization, not an authorization boundary.
