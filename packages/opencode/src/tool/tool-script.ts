@@ -11,6 +11,7 @@ import { Agent } from "@/agent/agent"
 import type { ModelID, ProviderID } from "../provider/schema"
 import { evalScript, type HostFn } from "../workflow/sandbox"
 import { toolScriptRegistry, TOOL_SCRIPT_ALIASES, TOOL_SCRIPT_EXCLUDED } from "./tool-script-ref"
+import type { HarnessMode } from "./gpt"
 import DESCRIPTION from "./tool-script.txt"
 import * as Tool from "./tool"
 import * as Truncate from "./truncate"
@@ -29,6 +30,7 @@ const MAX_CODE_BYTES = 128 * 1024
 const MAX_FILE_BYTES = 10 * 1024 * 1024
 const TRACE_TAIL_ENTRIES = 20
 const EXEC_COMMAND_DEFAULT_YIELD_TIME_MS = 10_000
+const EXEC_COMMAND_DEFAULT_MAX_OUTPUT_TOKENS = 10_000
 
 const ExecCommandParameters = z.object({
   cmd: z.string().describe("Shell command to execute."),
@@ -37,7 +39,15 @@ const ExecCommandParameters = z.object({
     .int()
     .min(1)
     .optional()
-    .describe(`Wait budget in milliseconds before the command is terminated. Defaults to ${EXEC_COMMAND_DEFAULT_YIELD_TIME_MS} ms.`),
+    .describe(
+      `Wait budget in milliseconds before the command is terminated. Defaults to ${EXEC_COMMAND_DEFAULT_YIELD_TIME_MS} ms.`,
+    ),
+  max_output_tokens: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(`Output token budget. Defaults to ${EXEC_COMMAND_DEFAULT_MAX_OUTPUT_TOKENS} tokens.`),
   workdir: z
     .string()
     .optional()
@@ -45,13 +55,14 @@ const ExecCommandParameters = z.object({
 })
 
 const EXEC_COMMAND_DESCRIPTION =
-  "Runs a shell command through the permission-gated bash executor. `cmd` is required; `yield_time_ms` is optional and defaults to 10000 ms."
+  "Runs a shell command through the permission-gated bash executor. `yield_time_ms` and `max_output_tokens` default to 10000. Output exceeding the token budget is saved to tool storage."
 
 function execCommandArgs(args: unknown) {
   const input = ExecCommandParameters.parse(args)
   return {
     command: input.cmd,
     timeout: input.yield_time_ms ?? EXEC_COMMAND_DEFAULT_YIELD_TIME_MS,
+    max_output_tokens: input.max_output_tokens ?? EXEC_COMMAND_DEFAULT_MAX_OUTPUT_TOKENS,
     workdir: input.workdir,
     description: input.cmd.length > 80 ? `${input.cmd.slice(0, 77)}...` : input.cmd,
   }
@@ -403,13 +414,14 @@ export const ToolScriptTool = Tool.define(
           if (!getDefs) throw new Error("exec tool registry unavailable")
           const agentInfo = yield* agents.get(ctx.agent)
           const model = ctx.extra?.model as { id: ModelID; providerID: ProviderID } | undefined
+          const harness = ctx.extra?.harness as HarnessMode | undefined
           const whitelist = Array.isArray(ctx.extra?.toolWhitelist)
             ? new Set(ctx.extra.toolWhitelist.filter((id): id is string => typeof id === "string"))
             : undefined
           const defs = (
             yield* getDefs(
               model
-                ? { providerID: model.providerID, modelID: model.id, agent: agentInfo }
+                ? { providerID: model.providerID, modelID: model.id, agent: agentInfo, harness }
                 : undefined,
             )
           ).filter((def) => !TOOL_SCRIPT_EXCLUDED.has(def.id) && (!whitelist || whitelist.has(def.id)))
