@@ -6,7 +6,7 @@ import ts from "typescript"
 import { Effect } from "effect"
 import type { Tool as AiTool } from "ai"
 import { EffectBridge, InstanceState } from "@/effect"
-import { Log, Filesystem } from "@/util"
+import { Log, Filesystem, ToolCompat } from "@/util"
 import { Agent } from "@/agent/agent"
 import type { ModelID, ProviderID } from "../provider/schema"
 import { evalScript, type HostFn } from "../workflow/sandbox"
@@ -353,7 +353,7 @@ export const ToolScriptTool = Tool.define(
         code: z
           .string()
           .describe(
-            "Raw JavaScript or TypeScript source for the body of an async function, not JSON or a Markdown code block. Call tools via the global `tools` object; inspect `ALL_TOOLS` when needed; `return` the final aggregated value.",
+            "The `code` field value is raw JavaScript or TypeScript source for the body of an async function, not JSON or a Markdown code block. The outer exec tool arguments must still be a JSON object containing this field. Call tools via the global `tools` object; inspect `ALL_TOOLS` when needed; `return` the final aggregated value.",
           ),
         max_tool_calls: z
           .number()
@@ -529,7 +529,8 @@ export const ToolScriptTool = Tool.define(
             const id = String(name)
             const alias = TOOL_SCRIPT_ALIASES[id as keyof typeof TOOL_SCRIPT_ALIASES]
             const def = byId.get(alias ?? id)
-            const mcpDef = def ? undefined : mcpById.get(id)
+            const mcpID = def ? undefined : ToolCompat.resolveName(id, [...mcpById.keys()])
+            const mcpDef = mcpID ? mcpById.get(mcpID) : undefined
             if (!def && !mcpDef) return Promise.reject(new Error(`unknown tool: ${id}`))
             const toolArgs = id === "exec_command" ? execCommandArgs(args) : args
             calls++
