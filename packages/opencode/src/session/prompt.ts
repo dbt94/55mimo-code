@@ -245,10 +245,11 @@ const elog = EffectLogger.create({ service: "session.prompt" })
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
-  readonly recovery: (input: { sessionID: SessionID; agentID?: string }) => Effect.Effect<RecoveryCandidate[]>
-  readonly resume: (input: ResumeTurnInput) => Effect.Effect<MessageV2.WithParts, InstanceType<typeof NotFoundError>>
+  readonly recovery: (input: { sessionID: SessionID; agentID?: string; allowBusy?: boolean }) => Effect.Effect<RecoveryCandidate[]>
+  readonly resume: (input: ResumeTurnInput) => Effect.Effect<MessageV2.WithParts, InstanceType<typeof NotFoundError> | Session.BusyError>
+  readonly resumeBackground: (input: ResumeTurnInput) => Effect.Effect<void, InstanceType<typeof NotFoundError> | Session.BusyError>
   readonly loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
+  readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   readonly sweepOrphanAssistants: (sessionID: SessionID, immediate?: boolean) => Effect.Effect<void>
@@ -1164,7 +1165,7 @@ Plan mode is active. The user wants you to research and design, NOT to execute y
 ## What you MUST NOT do
 - Do NOT edit or create any file other than the plan file below. Writes to non-plan files are blocked outright and will fail — do not attempt them and do not ask the user to approve them.
 - Do NOT run \`test\`, \`lint\`, \`typecheck\`, \`build\`, or similar project commands. These are NOT safe by default: \`lint\` is often configured with \`--fix\`, \`test\` may write snapshots or touch a database, \`build\` writes artifacts, and scripts behind them can do anything. The ONLY exception is if you have explicitly verified — by reading the exact command/config — that this specific invocation has no side effects (no \`--fix\`/\`--write\`, no file/state/db mutation). If you cannot verify that, treat it as forbidden and note it in the plan instead.
-- Do NOT run any other side-effecting \`bash\`: no commits, no \`git push\`, no installing/removing packages, no writing/moving/deleting files, no changing configs, no \`change_directory\`, no \`workflow\`.
+- Do NOT run any other side-effecting \`bash\`: no commits, no \`git push\`, no installing/removing packages, no writing/moving/deleting files, no changing configs, no \`workflow\`.
 - If you find yourself wanting to mutate something to make progress, that's a signal to write it into the plan instead and continue researching read-only.
 
 Use good judgment: take the read-only action yourself rather than pushing avoidable confirmation prompts onto the user. Only the plan file is writable.
@@ -1290,7 +1291,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         return new Set(actor.tools)
       })
       const whitelist = yield* whitelistFor()
-      const useGPTTools = usesGPTToolset(input.model.id, input.harness)
+      const useGPTTools = usesGPTToolset(input.model.id, input.harness, input.model.api.id, input.model.family)
       const execAllowedByWhitelist =
         useGPTTools &&
         !!whitelist &&
@@ -1394,6 +1395,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       // facing schema allowlist and stays compact in Codex mode.
       for (const item of yield* registry.registered({
         modelID: input.model.id,
+        apiModelID: input.model.api.id,
+        family: input.model.family,
         providerID: input.model.providerID,
         agent: input.agent,
         harness: input.harness,
@@ -2762,8 +2765,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       throw new Error("Impossible")
     })
 
-    const recovery = Effect.fn("SessionPrompt.recovery")(function* (input: { sessionID: SessionID; agentID?: string }) {
-      if ((yield* status.get(input.sessionID)).type !== "idle") return []
+    const recovery = Effect.fn("SessionPrompt.recovery")(function* (input: { sessionID: SessionID; agentID?: string; allowBusy?: boolean }) {
+      if (!input.allowBusy && (yield* status.get(input.sessionID)).type !== "idle") return []
       const msgs = yield* sessions.messages({ sessionID: input.sessionID, agentID: input.agentID ?? "main" })
       const candidates: RecoveryCandidate[] = []
       for (const [index, msg] of msgs.entries()) {
@@ -4172,7 +4175,8 @@ If this task is a simple fix, Q&A, or read-only operation, you can skip this not
                 Effect.provideService(ToolRegistry.Service, registry),
               )
             lastSystemPrompt = prebuiltSystem
-            const maxModeCfg = (yield* config.get()).experimental?.maxMode
+            const cfg = yield* config.get()
+            const maxModeCfg = cfg.experimental?.maxMode
             const useMaxMode =
               agent.name === MaxMode.MAX_MODE_AGENT && maxModeCfg !== undefined && format.type !== "json_schema"
 
@@ -4242,9 +4246,23 @@ If this task is a simple fix, Q&A, or read-only operation, you can skip this not
                   handle,
                   llm,
                   candidates: maxModeCfg?.candidates,
-                  setStatus: (message) =>
-                    status.set(sessionID, message ? { type: "busy", message } : { type: "busy" }),
-                })
+                  retryConfig: cfg,
+                 setStatus: (message) =>
+                   status.set(sessionID, message ? { type: "busy", message } : { type: "busy" }),
+                  onRetry: (info) =>
+                    bus.publish(Session.Event.RetryAttempt, {
+                      sessionID,
+                      messageID: handle.message.id,
+                      attempt: info.attempt,
+                      phaseAttempt: info.attempt,
+                      maxAttempts: info.maxAttempts,
+                      phase: info.phase,
+                      kind: info.kind,
+                      scope: info.scope,
+                      reason: info.message,
+                      nextDelayMs: info.nextDelayMs,
+                    }),
+               })
               : handle.process(processArgs)
 
             const result = yield* stepEffect.pipe(
@@ -4551,7 +4569,7 @@ If this task is a simple fix, Q&A, or read-only operation, you can skip this not
       )
     })
 
-    const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
+    const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts, Session.BusyError> = Effect.fn("SessionPrompt.shell")(
       function* (input: ShellInput) {
         return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input))
       },
@@ -4863,7 +4881,7 @@ If this task is a simple fix, Q&A, or read-only operation, you can skip this not
     })
 
     const resume = Effect.fn("SessionPrompt.resume")(function* (input: ResumeTurnInput) {
-      yield* state.assertNotBusy(input.sessionID)
+      yield* state.assertNotBusy(input.sessionID, input.agentID)
       const candidates = yield* recovery({ sessionID: input.sessionID, agentID: input.agentID })
       const candidate = candidates.find((item) => item.assistantMessageID === input.assistantMessageID)
       if (candidate === undefined) {
@@ -4894,11 +4912,44 @@ If this task is a simple fix, Q&A, or read-only operation, you can skip this not
       )
     })
 
+    const resumeBackground = Effect.fn("SessionPrompt.resumeBackground")(function* (input: ResumeTurnInput) {
+      const candidates = yield* recovery({ sessionID: input.sessionID, agentID: input.agentID, allowBusy: true })
+      const candidate = candidates.find((item) => item.assistantMessageID === input.assistantMessageID)
+      if (candidate === undefined) {
+        return yield* Effect.fail(
+          new NotFoundError({
+            message: "No resumable interrupted turn found for assistant message " + input.assistantMessageID,
+          }),
+        )
+      }
+      const agentID = input.agentID ?? "main"
+      yield* state.start(
+        input.sessionID,
+        agentID,
+        lastAssistant(input.sessionID, agentID),
+        runLoop(input.sessionID, agentID, input.task_id).pipe(
+          Effect.ensuring(
+            abandonRecoveredAssistant({ sessionID: input.sessionID, assistantMessageID: input.assistantMessageID, agentID }).pipe(
+              Effect.catchCause((cause) =>
+                elog.warn("recovered-assistant-abandon-failed", {
+                  sessionID: input.sessionID,
+                  messageID: input.assistantMessageID,
+                  cause,
+                }),
+              ),
+            ),
+          ),
+        ),
+      )
+      return
+    })
+
     const impl = Service.of({
       cancel,
       prompt,
       recovery,
       resume,
+      resumeBackground,
       loop,
       shell,
       command,
